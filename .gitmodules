@@ -1,3 +1,9 @@
 [submodule "thirdparty/uvgrtp"]
 	path = thirdparty/uvgrtp
 	url = https://github.com/ultravideo/uvgRTP.git
+[submodule "thirdparty/httplib"]
+	path = thirdparty/httplib
+	url = https://github.com/yhirose/cpp-httplib.git
+[submodule "thirdparty/json"]
+	path = thirdparty/json
+	url = https://github.com/nlohmann/json.git

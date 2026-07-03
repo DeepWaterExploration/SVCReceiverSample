@@ -5,10 +5,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_subdirectory(thirdparty/uvgrtp)
+add_subdirectory(thirdparty/httplib)
+add_subdirectory(thirdparty/json)
 
 add_executable(${PROJECT_NAME}
     src/sample.cc
-        src/sample.cc
 )
 
-target_link_libraries(${PROJECT_NAME} uvgrtp)
+target_include_directories(${PROJECT_NAME} PRIVATE thirdparty/stb)
+
+target_link_libraries(${PROJECT_NAME} uvgrtp httplib nlohmann_json::nlohmann_json)
