@@ -2,16 +2,17 @@
 #include <uvgrtp/lib.hh>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include <stb_image_write.h>
+#include <fp16.h>
+#include <happly.h>
 
 constexpr char SVC_ADDRESS[] = "dwe-jetson-11.local"; // Replace this with the actual address of your SVC
 constexpr uint16_t HTTP_PORT = 47001;                 // Hardcoded HTTP port (do not change)
 constexpr uint16_t RTP_PORT = 47002;                  // Default RTP port (can be anything, just make sure it's allowed by firewall and
                                                       // doesn't clash with other programs)
-constexpr int IMG_W = 800;
-constexpr int IMG_H = 600;
+
+constexpr int IMG_W = 800;                            // Output image width
+constexpr int IMG_H = 600;                            // Output image height
+
 constexpr int NTP_HEADER_SIZE = sizeof(int) * 3;      // Network protocol header size
 
 constexpr int DISP_SIZE = IMG_W * IMG_H * 2;          // Single channel 16-bit IEEE floats (disparity)
@@ -20,6 +21,8 @@ constexpr size_t BUF_SIZE = IMG_SIZE + DISP_SIZE;     // Left image + Left dispa
 
 std::atomic<bool> should_stay_connected{true};
 std::atomic<bool> should_poll{true};
+std::string calib_file;
+float fx_calib, cx_calib, cy_calib;
 using namespace nlohmann;
 
 /**
@@ -47,6 +50,7 @@ void subscribe(const std::string &addr) {
     }
 }
 
+void write_to_ply(const std::string& filename, uint16_t* disp, unsigned char* rgb);
 
 int main() {
     std::signal(SIGINT, [](int) {
@@ -68,11 +72,32 @@ int main() {
     std::string addr = std::string(SVC_ADDRESS) + ":" + std::to_string(HTTP_PORT);
     auto client = httplib::Client(addr);
 
+    // List on-board calibration files and choose 0th by default
+    {
+        auto res = client.Get("/list_calibrations");
+        if (!res || res->status != 200) {
+            std::cerr << "Failed to list calibrations." << std::endl;
+            return 1;
+        }
+        json body = json::parse(res->body);
+        if (!body.is_array() || body.empty()) {
+            std::cerr << "No calibration files detected. Is ~/RTPSender/calibrations empty on the SVC?" << std::endl;
+            return 1;
+        }
+        json calib = body[0];
+        std::cout << "Chose following calibration file: \n";
+        std::cout << calib.dump(2) << std::endl;
+        calib_file = calib["filename"];
+        fx_calib = calib["intrinsics"]["fx"];
+        cx_calib = calib["intrinsics"]["cx"];
+        cy_calib = calib["intrinsics"]["cy"];
+    }
+
     // Register this address as a client in the remote server
     std::thread subscribe_thread(subscribe, addr);
 
     json params;
-    params["calibration"]["filename"] = "e3d2001.dwecal";
+    params["calibration"]["filename"] = calib_file;
     params["network_protocol"] = "DEPTH_ONLY";
     params["depth_mode"]["frame_width"] = IMG_W;
     params["depth_mode"]["frame_height"] = IMG_H;
@@ -92,30 +117,89 @@ int main() {
         should_poll = false;
     } else if (res->status != 200) {
         std::cerr << "POST error: " << res->body << std::endl;
-        return 1;
+        should_stay_connected = false;
+        should_poll = false;
     }
 
     // Main application loop
-    int received_packets = 0;
-    std::cout << "Waiting for incoming packets." << std::endl;
+    std::cout << "Waiting for incoming packets..." << std::endl;
     while (should_poll) {
+        // This loop will not process all received packets as writing to a PLY is very slow. If your
+        // goal is to capture all packets, use the uvgRTP receive hook API and a queuing approach.
+
+        // Pull most recently received frame, if any
         auto frm = receiver->pull_frame(5000);
-        received_packets++;
+        if (!frm) {
+            std::cout << "Frame pull timed out. Trying again..." << std::endl;
+            continue;
+        }
         size_t expected_size = NTP_HEADER_SIZE + BUF_SIZE;
         if (frm->payload_len != expected_size) {
             std::cerr << "Received invalid frame of size " << frm->payload_len << ", expected " << expected_size <<
                     std::endl;
         } else {
-            if (stbi_write_png("left.png", IMG_W, IMG_H, 3, frm->payload + NTP_HEADER_SIZE, IMG_W * 3) == 0) {
-                std::cerr << "Failed to save image." << std::endl;
-            } else {
-                std::cout << "Wrote to png." << std::endl;
-            }
+            uint8_t* left_img = frm->payload + NTP_HEADER_SIZE;
+            uint16_t* disp = reinterpret_cast<uint16_t*>(left_img + IMG_SIZE);
+
+            // Write received disparity and RGB to PLY file. Overwrites the last written one if any
+            write_to_ply("left.ply", disp, left_img);
         }
         (void) uvgrtp::frame::dealloc_frame(frm);
     }
     std::cout << "Cleaning up resources... ";
     subscribe_thread.join();
-    std::cout << " done. Received " << received_packets << " total packets." << std::endl;
+    std::cout << " done." << std::endl;
     return 0;
+}
+
+/**
+ * Writes the given disparity and RGB buffers to a PLY. Better performance can be achieved via multi-threading or
+ * GPU usage.
+ */
+void write_to_ply(const std::string& filename, uint16_t* disp, unsigned char* rgb) {
+    constexpr int CALIB_W = 1600;    // Image width at calibration
+    constexpr int CALIB_H = 1200;    // Image height at calibration
+    constexpr float scale = 100;     // Scale factor (m -> cm)
+    constexpr float baseline = 0.1;  // Baseline of expore3D (m)
+    constexpr float min_depth = 0;   // Minimum depth (m)
+    constexpr float max_depth = 100; // Maximum depth (m)
+
+    std::vector<std::array<double, 3>> vertex_positions;
+    std::vector<std::array<double, 3>> vertex_colors;
+
+    float fx = fx_calib / (CALIB_W / (float)IMG_W);
+    float cx = cx_calib / (CALIB_W / (float)IMG_W);
+    float cy = cy_calib / (CALIB_H / (float)IMG_H);
+
+    for (int v = 0; v < IMG_H; ++v) {
+        for (int u = 0; u < IMG_W; ++u) {
+            float disparity = fp16_ieee_to_fp32_value(disp[v * IMG_W + u]);
+            if (disparity < 0.0001f) continue;
+
+            float t = scale * baseline / disparity;
+            float z = -t * fx;
+            float x = t * (u - cx);
+            float y = t * -(v - cy);
+            if (abs(z) < min_depth || abs(z) > max_depth) {
+                continue;
+            }
+            vertex_positions.push_back({x, y, z});
+
+            int idx = (v * IMG_W + u) * 3;
+            float r = rgb[idx + 0] / 255.0f;
+            float g = rgb[idx + 1] / 255.0f;
+            float b = rgb[idx + 2] / 255.0f;
+            vertex_colors.push_back({r, g, b});
+        }
+    }
+
+    try {
+        happly::PLYData ply;
+        ply.addVertexPositions(vertex_positions);
+        ply.addVertexColors(vertex_colors);
+        ply.write(filename, happly::DataFormat::Binary);
+        std::cout << "Wrote PLY." << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+    }
 }

@@ -12,6 +12,6 @@ add_executable(${PROJECT_NAME}
     src/sample.cc
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE thirdparty/stb)
+target_include_directories(${PROJECT_NAME} PRIVATE thirdparty/stb thirdparty/fp16/include thirdparty/happly)
 
 target_link_libraries(${PROJECT_NAME} uvgrtp httplib nlohmann_json::nlohmann_json)
