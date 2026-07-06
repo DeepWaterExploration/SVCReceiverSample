@@ -42,9 +42,7 @@ void subscribe(const std::string &addr) {
         return should_stay_connected.load();
     });
 
-    if (!res) {
-        std::cerr << "Connection requested timed out." << std::endl;
-    } else if (res->status != 200) {
+    if (res && res->status != 200) {
         std::cerr << "Failed to do GET request at /health: status " << res->status << std::endl;
     }
 }
@@ -90,17 +88,19 @@ int main() {
     auto res = client.Post("/start", params.dump(), "application/json");
     if (!res) {
         std::cerr << "Connection refused. Is the RTPSender process running on the target SVC?" << std::endl;
-        goto cleanup;
-    }
-    if (res->status != 200) {
+        should_stay_connected = false;
+        should_poll = false;
+    } else if (res->status != 200) {
         std::cerr << "POST error: " << res->body << std::endl;
         return 1;
     }
 
     // Main application loop
+    int received_packets = 0;
     std::cout << "Waiting for incoming packets." << std::endl;
     while (should_poll) {
         auto frm = receiver->pull_frame(5000);
+        received_packets++;
         size_t expected_size = NTP_HEADER_SIZE + BUF_SIZE;
         if (frm->payload_len != expected_size) {
             std::cerr << "Received invalid frame of size " << frm->payload_len << ", expected " << expected_size <<
@@ -108,15 +108,14 @@ int main() {
         } else {
             if (stbi_write_png("left.png", IMG_W, IMG_H, 3, frm->payload + NTP_HEADER_SIZE, IMG_W * 3) == 0) {
                 std::cerr << "Failed to save image." << std::endl;
-                return 1;
+            } else {
+                std::cout << "Wrote to png." << std::endl;
             }
-            std::cout << "Wrote to png." << std::endl;
         }
         (void) uvgrtp::frame::dealloc_frame(frm);
     }
-cleanup:
     std::cout << "Cleaning up resources... ";
     subscribe_thread.join();
-    std::cout << " done." << std::endl;
+    std::cout << " done. Received " << received_packets << " total packets." << std::endl;
     return 0;
 }
