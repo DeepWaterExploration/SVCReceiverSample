@@ -5,14 +5,18 @@
 #include <fp16.h>
 #include <happly.h>
 
-constexpr uint16_t HTTP_PORT = 47001;                 // Hardcoded HTTP port (do not change)
-constexpr uint16_t RTP_PORT = 47002;                  // Default RTP port (can be anything, just make sure it's allowed by firewall and
+constexpr uint16_t HTTP_PORT = 8000;                  // Hardcoded HTTP port (do not change)
+constexpr uint16_t RTP_PORT = 5600;                   // Default RTP port (can be anything, just make sure it's allowed by firewall and
                                                       // doesn't clash with other programs)
 
-constexpr int IMG_W = 800;                            // Output image width
-constexpr int IMG_H = 600;                            // Output image height
+constexpr int DEPTH_MODE = 0;                         // 0: SGM 800x600
+                                                      // 1: ML  400x300 (refined fast)
+                                                      // 2: ML  800x600 (refined pro)
 
-constexpr int NTP_HEADER_SIZE = sizeof(int) * 3;      // Network protocol header size
+constexpr int IMG_W = DEPTH_MODE == 1 ? 400 : 800;    // Output image width
+constexpr int IMG_H = DEPTH_MODE == 1 ? 300 : 600;    // Output image height
+
+constexpr int NTP_HEADER_SIZE = sizeof(int) * 2;      // Network protocol header size
 
 constexpr int DISP_SIZE = IMG_W * IMG_H * 2;          // Single channel 16-bit IEEE floats (disparity)
 constexpr int IMG_SIZE = IMG_W * IMG_H * 3;           // 3-channel 8-bit-per-channel RGB image (rectified and undistorted)
@@ -101,7 +105,7 @@ void write_to_ply(const std::string& filename, uint16_t* disp, unsigned char* rg
     }
 }
 
-json list_calibrations(httplib::Client& client) {
+void list_calibrations(httplib::Client& client) {
     auto res = client.Get("/list_calibrations");
     if (!res || res->status != 200) {
         std::cerr << "Failed to list calibrations." << std::endl;
@@ -113,7 +117,6 @@ json list_calibrations(httplib::Client& client) {
         exit(1);
     }
     std::cout << body.dump(2) << std::endl;
-    return body;
 }
 
 void list_dwvos(httplib::Client& client) {
@@ -197,22 +200,6 @@ int main(int argc, char **argv) {
         exit(0);
     }
 
-    // Grab calibration intrinsics
-    json calib_list = list_calibrations(client);
-    auto it = std::find_if(calib_list.begin(), calib_list.end(), [&](const json& obj) {
-        if (obj["filename"] == calib_file) {
-            fx_calib = obj["intrinsics"]["fx"];
-            cx_calib = obj["intrinsics"]["cx"];
-            cy_calib = obj["intrinsics"]["cy"];
-            return true;
-        }
-        return false;
-    });
-    if (it == calib_list.end()) {
-        std::cerr << "Specified calibration file not found." << std::endl;
-        exit(1);
-    }
-
     std::signal(SIGINT, [](int) {
         should_stay_connected = false;
         should_poll = false;
@@ -221,6 +208,14 @@ int main(int argc, char **argv) {
         should_stay_connected = false;
         should_poll = false;
     });
+
+    std::string depth_mode = "SGM";
+    if (DEPTH_MODE == 1) {
+        depth_mode = "REFINED_FAST";
+    }
+    if (DEPTH_MODE == 2) {
+        depth_mode = "REFINED_PRO";
+    }
 
     // Set up uvgRTP receiver
     uvgrtp::context ctx;
@@ -232,18 +227,16 @@ int main(int argc, char **argv) {
     std::thread subscribe_thread(subscribe, addr);
 
     json params;
-    params["calibration"]["filename"] = calib_file;
-    params["network_protocol"] = "DEPTH_ONLY";
-    params["depth_mode"]["frame_width"] = IMG_W;
-    params["depth_mode"]["frame_height"] = IMG_H;
-    params["depth_mode"]["name"] = "SGM";
+    params["calibration_path"] = calib_file;
+    params["depth_mode"] = depth_mode;
     params["input_dwvo"] = dwvo_file;
-    params["rtp_port"] = RTP_PORT;
+    params["port"] = RTP_PORT;
     params["resolution"] = "UXGA";
     params["input_type"] = input_type;
     params["input_left"] = left_bus_id;
     params["input_right"] = right_bus_id;
     params["swap_inputs"] = false;
+    params["gpu_id"] = 0;
     params["fps"] = 30;
 
     // POST to RTPSender /start endpoint. This starts the RTP stream with given parameters.
@@ -257,7 +250,13 @@ int main(int argc, char **argv) {
         std::cerr << "POST error: " << res->body << std::endl;
         should_stay_connected = false;
         should_poll = false;
+    } else {
+        json body = json::parse(res->body);
+        fx_calib = body["distParams"]["fx"];
+        cx_calib = body["distParams"]["cx"];
+        cy_calib = body["distParams"]["cy"];
     }
+
 
     // Main application loop
     std::cout << "Waiting for incoming packets. Press [Ctrl+C] to stop." << std::endl;
