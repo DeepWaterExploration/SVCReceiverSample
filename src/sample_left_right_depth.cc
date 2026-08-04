@@ -5,18 +5,25 @@
 #include <fp16.h>
 #include <happly.h>
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+
 constexpr uint16_t HTTP_PORT = 47001;                 // Hardcoded HTTP port (do not change)
 constexpr uint16_t RTP_PORT = 47002;                  // Default RTP port (can be anything, just make sure it's allowed by firewall and
                                                       // doesn't clash with other programs)
 
 constexpr int IMG_W = 800;                            // Output image width
 constexpr int IMG_H = 600;                            // Output image height
+                                                      // Supported dimensions are [400x300], [800x600]
+
+constexpr int FPS = 30;                               // Desired explore3D capture FPS. Can be 5, 10, 15, 30, 40, 50, 60. Packet receive rate
+                                                      // is throttled by depth process speed, which is around 15-30 depending on depth mode.
 
 constexpr int NTP_HEADER_SIZE = sizeof(int) * 3;      // Network protocol header size
 
 constexpr int DISP_SIZE = IMG_W * IMG_H * 2;          // Single channel 16-bit IEEE floats (disparity)
 constexpr int IMG_SIZE = IMG_W * IMG_H * 3;           // 3-channel 8-bit-per-channel RGB image (rectified and undistorted)
-constexpr size_t BUF_SIZE = IMG_SIZE + DISP_SIZE;     // Left image + Left disparity
+constexpr size_t BUF_SIZE = 2 * IMG_SIZE + DISP_SIZE; // Left image + Right image + Left disparity
 
 std::atomic<bool> should_stay_connected{true};
 std::atomic<bool> should_poll{true};
@@ -138,7 +145,7 @@ void list_devices(httplib::Client& client) {
 
 int main(int argc, char **argv) {
 
-    if (argc == 1) {
+    if (argc < 3) {
         std::cout << "Start USB stream:       " << argv[0] << " <svc-address> --USB <left-bus-id> <right-bus-id> <calibration-filename>" << std::endl;
         std::cout << "Start DWVO stream:      " << argv[0] << " <svc-address> --DWVO <dwvo-filename> <calibration-filename>" << std::endl;
         std::cout << "List calibration files: " << argv[0] << " <svc-address> -lc" << std::endl;
@@ -233,7 +240,7 @@ int main(int argc, char **argv) {
 
     json params;
     params["calibration"]["filename"] = calib_file;
-    params["network_protocol"] = "DEPTH_ONLY";
+    params["network_protocol"] = "SLAM"; // signals to send left image, right image, left disparity
     params["depth_mode"]["frame_width"] = IMG_W;
     params["depth_mode"]["frame_height"] = IMG_H;
     params["depth_mode"]["name"] = "SGM";
@@ -244,7 +251,7 @@ int main(int argc, char **argv) {
     params["input_left"] = left_bus_id;
     params["input_right"] = right_bus_id;
     params["swap_inputs"] = false;
-    params["fps"] = 30;
+    params["fps"] = FPS;
 
     // POST to RTPSender /start endpoint. This starts the RTP stream with given parameters.
     std::cout << "Starting stream..." << std::endl;
@@ -277,10 +284,14 @@ int main(int argc, char **argv) {
                     std::endl;
         } else {
             uint8_t* left_img = frm->payload + NTP_HEADER_SIZE;
-            uint16_t* disp = reinterpret_cast<uint16_t*>(left_img + IMG_SIZE);
+            uint8_t* right_img = left_img + IMG_SIZE;
+            uint16_t* disp = reinterpret_cast<uint16_t*>(right_img + IMG_SIZE);
 
             // Write received disparity and RGB to PLY file. Overwrites the last written one if any
             write_to_ply("left.ply", disp, left_img);
+
+            // Write right rectified image to PNG
+            stbi_write_png("right.png", IMG_W, IMG_H, 3, right_img, IMG_W * 3);
         }
         (void) uvgrtp::frame::dealloc_frame(frm);
     }

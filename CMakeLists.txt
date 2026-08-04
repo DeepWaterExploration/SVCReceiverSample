@@ -8,10 +8,11 @@ add_subdirectory(thirdparty/uvgrtp)
 add_subdirectory(thirdparty/httplib)
 add_subdirectory(thirdparty/json)
 
-add_executable(${PROJECT_NAME}
-    src/sample.cc
-)
+add_executable(left_depth src/sample_left_depth.cc)
+target_include_directories(left_depth PRIVATE thirdparty/stb thirdparty/fp16/include thirdparty/happly)
+target_link_libraries(left_depth uvgrtp httplib nlohmann_json::nlohmann_json)
 
-target_include_directories(${PROJECT_NAME} PRIVATE thirdparty/stb thirdparty/fp16/include thirdparty/happly)
 
-target_link_libraries(${PROJECT_NAME} uvgrtp httplib nlohmann_json::nlohmann_json)
+add_executable(left_right_depth src/sample_left_right_depth.cc)
+target_include_directories(left_right_depth PRIVATE thirdparty/stb thirdparty/fp16/include thirdparty/happly)
+target_link_libraries(left_right_depth uvgrtp httplib nlohmann_json::nlohmann_json)
